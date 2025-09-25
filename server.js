@@ -4,11 +4,11 @@ const express = require('express');
 const nodemailer = require('nodemailer');
 const cors = require('cors');
 const multer = require('multer');
-const fs = require('fs');
+const fs = require('fs/promises'); // Use promises for async file operations
 const path = require('path');
 
 const app = express();
-const port = 3000;
+const port = process.env.PORT || 3000; // Use Render's dynamic port
 
 // Middleware
 app.use(cors());
@@ -31,26 +31,24 @@ const upload = multer({ storage: storage });
 
 // The endpoint to handle the bulk email request
 app.post('/send-emails', upload.array('attachments'), async (req, res) => {
-    const { email, appPassword, recipients, subject, content, signature } = req.body;
-    const attachments = req.files;
-
-    if (!email || !appPassword || !recipients || !subject || !content) {
-        // Clean up uploaded files if there's a missing field
-        attachments.forEach(file => fs.unlinkSync(file.path));
-        return res.status(400).json({ error: 'Missing required fields.' });
-    }
-
+    let uploadedFilePaths = [];
     try {
-        // Nodemailer transporter setup with certificate bypass
+        const { email, appPassword, recipients, subject, content, signature } = req.body;
+        const attachments = req.files;
+        
+        // Store paths for cleanup in case of an error
+        uploadedFilePaths = attachments.map(file => file.path);
+
+        if (!email || !appPassword || !recipients || !subject || !content) {
+            return res.status(400).json({ error: 'Missing required fields.' });
+        }
+
         const transporter = nodemailer.createTransport({
             service: 'gmail',
             auth: {
                 user: email,
                 pass: appPassword,
             },
-            tls: {
-                rejectUnauthorized: false // This bypasses the certificate error
-            }
         });
 
         const fullContent = `${content}<br><br>${signature.replace(/\n/g, '<br>')}`;
@@ -68,36 +66,34 @@ app.post('/send-emails', upload.array('attachments'), async (req, res) => {
                 })),
             };
 
-            return new Promise((resolve) => {
-                transporter.sendMail(mailOptions, (error, info) => {
-                    if (error) {
-                        console.error(`Error sending email to ${recipient}:`, error);
-                        resolve({ recipient, status: 'error', error: error.message });
-                    } else {
-                        console.log(`Email sent to ${recipient}: ${info.response}`);
-                        resolve({ recipient, status: 'success' });
-                    }
-                });
-            });
+            return transporter.sendMail(mailOptions);
         });
 
-        const results = await Promise.all(mailPromises);
+        await Promise.allSettled(mailPromises);
 
         // Clean up uploaded files after sending
-        attachments.forEach(file => {
-            fs.unlink(file.path, (err) => {
-                if (err) console.error(`Failed to delete temporary file: ${file.path}`, err);
-            });
-        });
+        for (const filePath of uploadedFilePaths) {
+            await fs.unlink(filePath);
+        }
 
         res.status(200).json({
             message: 'Bulk email process completed.',
-            results: results,
+            // For security, do not send recipient list or detailed results back to the client
         });
     } catch (error) {
         console.error('An unhandled server error occurred:', error);
+        
         // Ensure files are deleted even on unhandled errors
-        attachments.forEach(file => fs.unlinkSync(file.path));
+        if (uploadedFilePaths.length > 0) {
+            for (const filePath of uploadedFilePaths) {
+                try {
+                    await fs.unlink(filePath);
+                } catch (cleanupError) {
+                    console.error('Failed to delete temporary file during error cleanup:', cleanupError);
+                }
+            }
+        }
+        
         res.status(500).json({ error: 'Internal server error.' });
     }
 });
